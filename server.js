@@ -1,5 +1,5 @@
 // server.js (ESM)
-// Requisitos: Node 18+ (fetch nativo), "type":"module" en package.json (si usas import)
+// Requisitos: Node 18+ (fetch nativo), "type":"module" en package.json
 
 import cors from 'cors';
 import 'dotenv/config';
@@ -19,6 +19,9 @@ const FALLBACK_MODELS = (process.env.FALLBACK_MODELS?.split(',') || [
   'gpt-4o'
 ]).map(s => s.trim()).filter(Boolean);
 
+// ⬇⬇ 10 minutos por turno (600 s)
+const DEFAULT_TURN_SEC = 600;
+
 // ================== App & IO ==================
 const app = express();
 app.use(cors());
@@ -30,10 +33,8 @@ const io = new Server(httpServer, { cors: { origin: '*' } });
 // ================== Estado en memoria ==================
 /** roomId -> Map<socketId, { id, name }> */
 const roomMembers = new Map();
-
 /** roomId -> { system, messages: [{role,content}], lastAskAt, dmMode } */
 const roomContexts = new Map();
-
 /** roomId -> CombatState */
 const combatStates = new Map();
 
@@ -60,17 +61,20 @@ function buildSystemPrompt() {
 - Evita metajuego y no mates gratuitamente a los PJ.
 - Responde en español.
 
-CUANDO CORRESPONDA, añade AL FINAL de tu mensaje UNA sola línea de control, exactamente con uno de estos comandos:
-[CMD:START_COMBAT duration=60 auto=1 delay=1]
+CUANDO CORRESPONDA, añade AL FINAL de tu mensaje UNA sola línea de control,
+exactamente con uno de estos comandos:
+[CMD:START_COMBAT]                      ← si omites duración, el servidor usará 600 s
+[CMD:START_COMBAT duration=SEGUNDOS]    ← opcional; ej. duration=120
 [CMD:REROLL]
 [CMD:NEXT_TURN]
 [CMD:PREV_TURN]
 [CMD:END_COMBAT]
 [CMD:PAUSE]
 [CMD:RESUME]
-[CMD:SETTINGS duration=45 auto=0 delay=0]
+[CMD:SETTINGS duration=SEGUNDOS auto=0|1 delay=SEGUNDOS]
 [CMD:SYNC_PLAYERS]
-No inventes otros comandos y no añadas comillas alrededor de la línea CMD.`;
+No inventes otros comandos y no añadas comillas alrededor de la línea CMD.
+Escribe “duration” en **segundos** y OMITE la duración si quieres el valor por defecto (600 s).`;
 }
 
 function getRoomContext(roomId) {
@@ -130,8 +134,8 @@ async function askOpenAIWithFallback(allMessages) {
       lastErr = e;
       const notFound = e?.status === 404 || e?.code === 'model_not_found';
       const insufficient = e?.status === 429 && (e?.code === 'insufficient_quota' || /quota/i.test(e?.message || ''));
-      if (insufficient) throw e; // no hay cuota: salir
-      if (!notFound) throw e;    // error distinto: salir
+      if (insufficient) throw e; // no hay cuota
+      if (!notFound) throw e;    // otro error
       console.warn(`[DM] Modelo no disponible: ${m} (${e?.code || e?.status}). Probando siguiente...`);
     }
   }
@@ -167,18 +171,14 @@ function mockDMReply(userText) {
 // ================== Lógica principal DM ==================
 async function askDM(roomId, userMessage) {
   const ctx = getRoomContext(roomId);
-
-  // Antispam simple por sala
   const now = Date.now();
   if (now - ctx.lastAskAt < RATE_LIMIT_MS) {
     return '⏳ Espera un poco antes de volver a preguntar al DM.';
   }
   ctx.lastAskAt = now;
 
-  // Guarda mensaje de usuario
   ctx.messages.push({ role: 'user', content: userMessage });
 
-  // Modo mock forzado o sin API key
   if (ctx.dmMode === 'mock' || DM_MODE === 'mock' || !OPENAI_API_KEY) {
     const mock = mockDMReply(userMessage);
     ctx.messages.push({ role: 'assistant', content: mock });
@@ -186,9 +186,7 @@ async function askDM(roomId, userMessage) {
     return mock;
   }
 
-  // Intento con OpenAI
   const allMessages = [{ role: 'system', content: ctx.system }, ...ctx.messages];
-
   try {
     const reply = await askOpenAIWithFallback(allMessages);
     ctx.messages.push({ role: 'assistant', content: reply });
@@ -198,7 +196,6 @@ async function askDM(roomId, userMessage) {
     console.error('[DM] Error OpenAI:', err);
     const insufficient = err?.status === 429 && (err?.code === 'insufficient_quota' || /quota/i.test(err?.message || ''));
     if (insufficient) {
-      // Cambiamos a mock para esta sala y avisamos
       ctx.dmMode = 'mock';
       const reply = [
         '⚠️ OpenAI sin cuota en este momento. Cambio automático a DM local.',
@@ -208,7 +205,6 @@ async function askDM(roomId, userMessage) {
       ctx.messages.push({ role: 'assistant', content: reply });
       return reply;
     }
-    // Otros errores: informar sin cambiar modo
     return `⚠️ Error del modelo: ${err?.message || err?.code || err?.status || 'desconocido'}`;
   }
 }
@@ -217,7 +213,6 @@ async function askDM(roomId, userMessage) {
 app.post('/api/dm', async (req, res) => {
   const { roomId = 'default', message = '' } = req.body || {};
   const reply = await askDM(roomId, message);
-  // Ejecuta comandos si vinieran en la respuesta
   handleDMCommands(io, roomId, reply);
   res.json({ reply });
 });
@@ -252,6 +247,7 @@ function scheduleAdvance(io, roomId) {
 
   const now = Date.now();
   const ms = Math.max(0, st.endAt - now) + Math.max(0, (st.autoDelaySec ?? 0) * 1000);
+
   st._timer = setTimeout(() => {
     const next = st.turnIndex + 1;
     if (next >= st.list.length) {
@@ -278,16 +274,18 @@ function startCombat(io, roomId, opts = {}) {
     init: 1 + Math.floor(Math.random() * 20)
   })).sort((a, b) => b.init - a.init || a.name.localeCompare(b.name));
 
+  const dur = Math.max(10, Math.min(3600, Number(opts.durationSec) || DEFAULT_TURN_SEC));
+
   const st = {
     roomId,
     list,
     round: 1,
     turnIndex: 0,
-    durationSec: Math.max(10, Math.min(600, Number(opts.durationSec) || 60)),
+    durationSec: dur,
     autoAdvance: typeof opts.autoAdvance === 'boolean' ? opts.autoAdvance : true,
     autoDelaySec: Math.max(0, Math.min(10, Number(opts.autoDelaySec) || 1)),
     running: true,
-    endAt: Date.now() + (Number(opts.durationSec) || 60) * 1000,
+    endAt: Date.now() + dur * 1000,
     _timer: null
   };
   combatStates.set(roomId, st);
@@ -298,6 +296,7 @@ function startCombat(io, roomId, opts = {}) {
   scheduleAdvance(io, roomId);
   return st;
 }
+
 function rerollCombat(io, roomId) {
   const st = combatStates.get(roomId);
   if (!st) return startCombat(io, roomId, {});
@@ -314,6 +313,7 @@ function rerollCombat(io, roomId) {
   io.to(roomId).emit('combat:update', publicCombatState(st));
   scheduleAdvance(io, roomId);
 }
+
 function nextTurn(io, roomId) {
   const st = combatStates.get(roomId);
   if (!st || !st.list.length) return;
@@ -331,6 +331,7 @@ function nextTurn(io, roomId) {
   io.to(roomId).emit('combat:update', publicCombatState(st));
   scheduleAdvance(io, roomId);
 }
+
 function prevTurn(io, roomId) {
   const st = combatStates.get(roomId);
   if (!st || !st.list.length) return;
@@ -341,6 +342,7 @@ function prevTurn(io, roomId) {
   io.to(roomId).emit('combat:update', publicCombatState(st));
   scheduleAdvance(io, roomId);
 }
+
 function endCombat(io, roomId) {
   const st = combatStates.get(roomId);
   if (st) clearTimeout(st._timer);
@@ -355,11 +357,12 @@ function endCombat(io, roomId) {
     serverNow: Date.now()
   });
 }
+
 function applySettings(io, roomId, opts) {
   const st = combatStates.get(roomId);
   if (!st) return;
   if (typeof opts.durationSec === 'number' && opts.durationSec > 0)
-    st.durationSec = Math.max(10, Math.min(600, Math.round(opts.durationSec)));
+    st.durationSec = Math.max(10, Math.min(600, Math.round(opts.durationSec))); // tope 10 min (ajústalo si quieres)
   if (typeof opts.autoAdvance === 'boolean') st.autoAdvance = opts.autoAdvance;
   if (typeof opts.autoDelaySec === 'number')
     st.autoDelaySec = Math.max(0, Math.min(10, Math.round(opts.autoDelaySec)));
@@ -368,6 +371,7 @@ function applySettings(io, roomId, opts) {
   io.to(roomId).emit('combat:update', publicCombatState(st));
   scheduleAdvance(io, roomId);
 }
+
 function syncPlayers(io, roomId) {
   const st = combatStates.get(roomId);
   if (!st) return;
@@ -390,20 +394,26 @@ function parseKv(str) {
   });
   return out;
 }
+
 function handleDMCommands(io, roomId, text) {
   const re = /\[CMD:([A-Z_]+)([^\]]*)\]/g;
   let m;
   while ((m = re.exec(text)) !== null) {
     const cmd = m[1];
     const kv = parseKv(m[2] || '');
+
     switch (cmd) {
-      case 'START_COMBAT':
+      case 'START_COMBAT': {
+        // ⬇ NO fijamos 60 por defecto; si no hay duration → undefined (usa DEFAULT_TURN_SEC)
+        const raw = (kv.duration ?? kv.duracion);
+        const durationSec = raw != null && raw !== '' ? Number(raw) : undefined;
         startCombat(io, roomId, {
-          durationSec: Number(kv.duration ?? kv.duracion ?? 60),
+          durationSec,
           autoAdvance: ['1', 'true', 'si', 'sí'].includes(String(kv.auto ?? '1').toLowerCase()),
           autoDelaySec: Number(kv.delay ?? 1)
         });
         break;
+      }
       case 'REROLL':      rerollCombat(io, roomId); break;
       case 'NEXT_TURN':   nextTurn(io, roomId);     break;
       case 'PREV_TURN':   prevTurn(io, roomId);     break;
@@ -418,13 +428,15 @@ function handleDMCommands(io, roomId, text) {
         if (st) { st.running = true; st.endAt = Date.now() + (st.durationSec * 1000); io.to(roomId).emit('combat:update', publicCombatState(st)); scheduleAdvance(io, roomId); }
         break;
       }
-      case 'SETTINGS':
+      case 'SETTINGS': {
+        const rawDur = kv.duration ?? kv.duracion;
         applySettings(io, roomId, {
-          durationSec: kv.duration ? Number(kv.duration) : undefined,
+          durationSec: rawDur != null && rawDur !== '' ? Number(rawDur) : undefined,
           autoAdvance: kv.auto != null ? ['1','true','si','sí'].includes(String(kv.auto).toLowerCase()) : undefined,
           autoDelaySec: kv.delay != null ? Number(kv.delay) : undefined
         });
         break;
+      }
       case 'SYNC_PLAYERS': syncPlayers(io, roomId); break;
       default: break;
     }
@@ -437,28 +449,20 @@ function stripDiacritics(s) {
 }
 function detectImplicitCmd(userText) {
   const t = stripDiacritics((userText || '').toLowerCase());
-  // START
   if (/(inicia(r)?|empieza(r)?|empezamos|comenzar|comienza).*(combate|encuentro)|^start\b.*(combat|encounter)/.test(t))
     return { cmd: 'START_COMBAT' };
-  // REROLL
   if (/(re[-\s]?tirar|re[-\s]?tira|re[-\s]?tiramos|reroll|reordenar).*(iniciativa|orden)?/.test(t))
     return { cmd: 'REROLL' };
-  // NEXT
   if (/(siguiente|avanza|pasa|proximo|turno siguiente)/.test(t))
     return { cmd: 'NEXT_TURN' };
-  // PREV
   if (/(anterior|retrocede|vuelve atras)/.test(t))
     return { cmd: 'PREV_TURN' };
-  // END
   if (/(termina(r)?|fin|acaba(r)?)\s*(el)?\s*(combate|encuentro)/.test(t))
     return { cmd: 'END_COMBAT' };
-  // PAUSE
   if (/(pausa|pausar|deten|stop)\b/.test(t))
     return { cmd: 'PAUSE' };
-  // RESUME
   if (/(reanuda|resume|continuar|seguir|play)\b/.test(t))
     return { cmd: 'RESUME' };
-  // SETTINGS (duración/retardo/auto)
   const mDur = t.match(/\b(duracion|duration)\s*(=|:)?\s*(\d{1,3})\b/);
   const mDel = t.match(/\b(retardo|delay)\s*(=|:)?\s*(\d{1,2})\b/);
   const mAut = t.match(/\b(auto|automatico|autoavance)\s*(=|:)?\s*(si|sí|no|true|false|1|0)\b/);
@@ -480,6 +484,13 @@ io.on('connection', (socket) => {
   let currentRoom = null;
   let nickname = `Jugador-${socket.id.slice(0, 4)}`;
 
+  function stripCmdLines(s = '') {
+    if (!s) return s;
+    let out = s.split(/\r?\n/).filter(line => !/^\s*\[CMD:[^\]]+\]\s*$/i.test(line)).join('\n');
+    out = out.replace(/\s*\[CMD:[^\]]+\]\s*/gi, ' ').replace(/\s{2,}/g, ' ').trim();
+    return out;
+  }
+
   function joinRoom(roomId, name) {
     if (currentRoom) socket.leave(currentRoom);
     currentRoom = roomId || 'default';
@@ -494,21 +505,9 @@ io.on('connection', (socket) => {
 
     socket.to(currentRoom).emit('system', `${nickname} se ha unido a la mesa.`);
 
-    // Estado de combate actual
     const st = combatStates.get(currentRoom);
     if (st) socket.emit('combat:update', publicCombatState(st));
   }
-
-  // Elimina líneas/fragmentos [CMD:...] de un texto
-function stripCmdLines(s = '') {
-  if (!s) return s;
-  // 1) quita líneas completas con solo el CMD
-  let out = s.split(/\r?\n/).filter(line => !/^\s*\[CMD:[^\]]+\]\s*$/i.test(line)).join('\n');
-  // 2) por si aparece inline, elimina el token
-  out = out.replace(/\s*\[CMD:[^\]]+\]\s*/gi, ' ').replace(/\s{2,}/g, ' ').trim();
-  return out;
-}
-
 
   // Presencia
   socket.on('join', ({ roomId, name }) => joinRoom(roomId, name));
@@ -519,15 +518,13 @@ function stripCmdLines(s = '') {
     if (!currentRoom) return;
     const payload = { from: nickname, text, ts: Date.now() };
     io.to(currentRoom).emit('chat', payload);
-  
+
     if (dm || /^@dm\b/i.test(text)) {
       const userText = text.replace(/^@dm\b/i, '').trim();
-  
-      // 1) INTENTO INMEDIATO: detectar comando implícito
+
+      // 1) Comando implícito inmediato (sin esperar a la IA)
       const implicit = detectImplicitCmd(userText);
-      let ranImplicit = false;
       if (implicit) {
-        ranImplicit = true;
         switch (implicit.cmd) {
           case 'START_COMBAT': startCombat(io, currentRoom, {}); break;
           case 'REROLL':       rerollCombat(io, currentRoom);    break;
@@ -546,10 +543,8 @@ function stripCmdLines(s = '') {
           }
           case 'SETTINGS':     applySettings(io, currentRoom, implicit.opts || {}); break;
         }
-        // 👇 QUITAMOS este aviso para no “mostrar” comandos en el chat
-        // io.to(currentRoom).emit('system', `🤖 DM: orden recibida (${implicit.cmd.replace('_',' ')})`);
       }
-  
+
       // 2) Pide narrativa a la IA
       const replyRaw = await askDM(currentRoom, userText || text);
       // 3) Ejecuta comandos que vengan en la respuesta
@@ -561,7 +556,6 @@ function stripCmdLines(s = '') {
       }
     }
   });
-  
 
   // Tiradas
   socket.on('roll', ({ notation }) => {
@@ -600,6 +594,36 @@ function stripCmdLines(s = '') {
     socket.emit('combat:update', st ? publicCombatState(st) : {
       roomId: currentRoom, list: [], round: 1, turnIndex: 0, running: false, serverNow: Date.now()
     });
+  });
+
+  // Finalizar turno por jugador activo
+  socket.on('combat:finishTurn', () => {
+    if (!currentRoom) return;
+    const st = combatStates.get(currentRoom);
+    if (!st || !st.list.length) return;
+    const activeEntry = st.list[st.turnIndex];
+    if (!activeEntry) return;
+
+    if (socket.id !== activeEntry.id) {
+      return socket.emit('system', '⛔ Solo el jugador en turno puede finalizar su turno.');
+    }
+
+    io.to(currentRoom).emit('system', `⏭️ **${activeEntry.name}** finaliza su turno.`);
+
+    const next = st.turnIndex + 1;
+    if (next >= st.list.length) {
+      st.turnIndex = 0;
+      st.round += 1;
+      io.to(currentRoom).emit('system', `🌀 **Ronda ${st.round}** — turno de **${st.list[0]?.name ?? '—'}**`);
+    } else {
+      st.turnIndex = next;
+    }
+    st.endAt = Date.now() + st.durationSec * 1000;
+    st.running = true;
+
+    combatStates.set(currentRoom, st);
+    io.to(currentRoom).emit('combat:update', publicCombatState(st));
+    scheduleAdvance(io, currentRoom);
   });
 
   // Desconexión
