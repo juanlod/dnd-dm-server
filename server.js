@@ -110,7 +110,8 @@ exactamente con uno de estos comandos:
 [CMD:SETTINGS duration=SEGUNDOS auto=0|1 delay=SEGUNDOS]
 [CMD:SYNC_PLAYERS]
 No inventes otros comandos y no añadas comillas alrededor de la línea CMD.
-Escribe “duration” en segundos y OMITE la duración si quieres el valor por defecto (600 s).`;
+Escribe “duration” en segundos y OMITE la duración si quieres el valor por defecto (600 s).
+SI introduces criaturas hostiles, un enfrentamiento o pides “tirar iniciativa”, TERMINA tu respuesta con [CMD:START_COMBAT]`;
 }
 
 
@@ -701,6 +702,9 @@ io.on('connection', (socket) => {
         }
       }
 
+      // 1.5) Si el jugador ya anuncia hostilidad, inicia combate YA
+      maybeAutoStartCombat(io, currentRoom, userText);
+
       // 2) Pide narrativa a la IA
       const replyRaw = await askDM(currentRoom, userText || text);
       // 3) Ejecuta comandos que vengan en la respuesta
@@ -710,6 +714,8 @@ io.on('connection', (socket) => {
       if (reply.trim()) {
         io.to(currentRoom).emit('dm', { from: 'DM', text: reply, ts: Date.now() });
       }
+      // 4.5) Heurística por si el DM describe combate pero olvidó el CMD
+      +   maybeAutoStartCombat(io, currentRoom, reply);
     }
   });
 
@@ -836,6 +842,8 @@ io.on('connection', (socket) => {
     io.to(currentRoom).emit('system', '♻️ El contexto del DM se ha reiniciado para esta mesa.');
   });
 
+
+
 });
 
 // ================== Dados ==================
@@ -855,3 +863,24 @@ function rollDice(notation = '1d20+0') {
 httpServer.listen(PORT, () => {
   console.log(`D&D DM server escuchando en http://localhost:${PORT}`);
 });
+
+function inCombat(roomId) {
+  const st = combatStates.get(roomId);
+  return !!(st && st.list && st.list.length);
+}
+
+// Heurística ligera: verbos de combate + mención de criatura / “iniciativa”
+function looksLikeHostileEncounter(text = '') {
+  const t = stripDiacritics(String(text).toLowerCase());
+  const verbs = /(atac|embosc|arremet|abalanz|hostil|pelea|combate|iniciativa|iniciad|iniciar combate|turno)/;
+  const creatures = /(goblin|trasgo|orco|ogro|troll|trol|bandid|esquelet|zombi|zombie|lobo|arañ|mimic|mímic|drag|gnoll|kobold|ogre|súcub|diabl|demon|espectr|ghoul|bestia)/;
+  return verbs.test(t) && (creatures.test(t) || /iniciativa/.test(t));
+}
+
+function maybeAutoStartCombat(io, roomId, text) {
+  if (inCombat(roomId)) return;
+  if (looksLikeHostileEncounter(text)) {
+    startCombat(io, roomId, {}); // usa DEFAULT_TURN_SEC
+    io.to(roomId).emit('system', '⚔️ Encuentro hostil detectado: iniciando combate.');
+  }
+}
