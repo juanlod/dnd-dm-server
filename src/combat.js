@@ -23,7 +23,7 @@ export function scheduleAdvance(io, roomId) {
     if (next >= st.list.length) {
       st.turnIndex = 0;
       st.round += 1;
-      io.to(roomId).emit('system', `🌀 **Ronda ${st.round}** — turno de **${st.list[0]?.name ?? '—'}**`);
+      // io.to(roomId).emit('system', `🌀 **Ronda ${st.round}** — turno de **${st.list[0]?.name ?? '—'}**`);
     } else {
       st.turnIndex = next;
     }
@@ -91,7 +91,7 @@ export function nextTurn(io, roomId) {
   if (next >= st.list.length) {
     st.turnIndex = 0;
     st.round += 1;
-    io.to(roomId).emit('system', `🌀 **Ronda ${st.round}** — turno de **${st.list[0]?.name ?? '—'}**`);
+    // io.to(roomId).emit('system', `🌀 **Ronda ${st.round}** — turno de **${st.list[0]?.name ?? '—'}**`);
   } else {
     st.turnIndex = next;
   }
