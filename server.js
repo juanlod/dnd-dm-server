@@ -37,7 +37,9 @@ const roomMembers = new Map();
 const roomContexts = new Map();
 /** roomId -> CombatState */
 const combatStates = new Map();
-
+const roomChars = new Map();
+/** roomId -> Timeout (debounce para síntesis automática) */
+const partySynthTimers = new Map();
 // ================== Util presencia ==================
 function getRoomMembers(roomId) {
   if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Map());
@@ -171,22 +173,33 @@ function mockDMReply(userText) {
 // ================== Lógica principal DM ==================
 async function askDM(roomId, userMessage) {
   const ctx = getRoomContext(roomId);
+
+  // Anti-spam simple por sala
   const now = Date.now();
   if (now - ctx.lastAskAt < RATE_LIMIT_MS) {
     return '⏳ Espera un poco antes de volver a preguntar al DM.';
   }
   ctx.lastAskAt = now;
 
+  // Guarda el mensaje del usuario en el historial de la sala
   ctx.messages.push({ role: 'user', content: userMessage });
 
+  // Construimos el prompt SIEMPRE con el contexto de fichas actual
+  const partyCtx = partyContextText(roomId);
+  const allMessages = [
+    { role: 'system', content: ctx.system },
+    { role: 'system', content: partyCtx },     // 👈 fichas de la sala para el DM
+    ...ctx.messages
+  ];
+
+  // Modo mock o sin API
   if (ctx.dmMode === 'mock' || DM_MODE === 'mock' || !OPENAI_API_KEY) {
-    const mock = mockDMReply(userMessage);
-    ctx.messages.push({ role: 'assistant', content: mock });
+    const reply = mockDMReply(userMessage); // no mostramos el partyCtx al jugador
+    ctx.messages.push({ role: 'assistant', content: reply });
     if (ctx.messages.length > 40) ctx.messages.splice(0, 10);
-    return mock;
+    return reply;
   }
 
-  const allMessages = [{ role: 'system', content: ctx.system }, ...ctx.messages];
   try {
     const reply = await askOpenAIWithFallback(allMessages);
     ctx.messages.push({ role: 'assistant', content: reply });
@@ -197,17 +210,107 @@ async function askDM(roomId, userMessage) {
     const insufficient = err?.status === 429 && (err?.code === 'insufficient_quota' || /quota/i.test(err?.message || ''));
     if (insufficient) {
       ctx.dmMode = 'mock';
-      const reply = [
+      const fallback = mockDMReply(userMessage);
+      ctx.messages.push({ role: 'assistant', content: fallback });
+      return [
         '⚠️ OpenAI sin cuota en este momento. Cambio automático a DM local.',
         '',
-        mockDMReply(userMessage)
+        fallback
       ].join('\n');
-      ctx.messages.push({ role: 'assistant', content: reply });
-      return reply;
     }
     return `⚠️ Error del modelo: ${err?.message || err?.code || err?.status || 'desconocido'}`;
   }
 }
+
+// === DM interno (sin rate limit, sin historial) ===
+async function askDMSystem(roomId, userMessage) {
+  const ctx = getRoomContext(roomId);
+
+  // Construye mensajes sin tocar ctx.messages ni ctx.lastAskAt
+  const allMessages = [
+    { role: 'system', content: ctx.system },
+    { role: 'system', content: partyContextText(roomId) },
+    { role: 'user', content: userMessage }
+  ];
+
+  // Modo mock o sin API -> mismo mock pero directo
+  if (ctx.dmMode === 'mock' || DM_MODE === 'mock' || !OPENAI_API_KEY) {
+    return mockDMReply(userMessage);
+  }
+
+  try {
+    return await askOpenAIWithFallback(allMessages);
+  } catch (err) {
+    console.error('[DM] Error OpenAI (system):', err);
+    // Devuelve un fallback breve, pero no rompe el flujo
+    return '📘 He actualizado mentalmente el estado del grupo.';
+  }
+}
+
+
+function getRoomCharsMap(roomId) {
+  if (!roomChars.has(roomId)) roomChars.set(roomId, new Map());
+  return roomChars.get(roomId);
+}
+
+/** Resumen compacto del grupo (una línea por PJ) */
+function partyContextText(roomId) {
+  const map = roomChars.get(roomId);
+  if (!map || map.size === 0) return 'No hay fichas compartidas en esta sala.';
+  const lines = [];
+  for (const { name, sheet } of map.values()) {
+    if (!sheet) continue;
+    const pj = sheet.name || name || 'PJ';
+    const lvl = sheet.level ?? 1;
+    const clazz = sheet.clazz || 'Clase ?';
+    const ac = sheet.ac ?? 10;
+    const hpCur = sheet.hp ?? sheet.maxHp ?? 0;
+    const hpMax = sheet.maxHp ?? 0;
+    const pp = sheet.senses?.passivePerception ?? 10;
+    const speed = sheet.speed ?? 30;
+    lines.push(`- ${pj} — ${clazz} ${lvl} • CA ${ac} • HP ${hpCur}/${hpMax} • PP ${pp} • Vel ${speed}`);
+  }
+  return `Contexto del grupo:\n${lines.join('\n')}`;
+}
+
+/** Limpia [CMD:...] si ya no tienes este helper en el archivo */
+function stripCmdLines(s = '') {
+  if (!s) return s;
+  let out = s.split(/\r?\n/).filter(line => !/^\s*\[CMD:[^\]]+\]\s*$/i.test(line)).join('\n');
+  out = out.replace(/\s*\[CMD:[^\]]+\]\s*/gi, ' ').replace(/\s{2,}/g, ' ').trim();
+  return out;
+}
+/** Lanza una síntesis automática del grupo usando el DM (con debounce por sala) */
+function schedulePartySynthesis(io, roomId) {
+  const delay = 1600; // un poco más que RATE_LIMIT_MS por defecto, y así no molesta al usuario
+  const prev = partySynthTimers.get(roomId);
+  if (prev) clearTimeout(prev);
+  const t = setTimeout(() => { doPartySynthesis(io, roomId).catch(console.error); }, delay);
+  partySynthTimers.set(roomId, t);
+}
+
+async function doPartySynthesis(io, roomId) {
+  const summary = partyContextText(roomId);
+  if (!summary || /No hay fichas/i.test(summary)) return; // no hay nada que sintetizar
+
+  const userMsg = [
+    'Sistema de mesa: se han añadido/actualizado fichas.',
+    summary,
+    '',
+    'Escribe una breve síntesis del grupo en 1–2 frases (roles y estado general) y sugiere un siguiente paso.',
+    'NO añadas líneas [CMD:...] en esta respuesta.'
+  ].join('\n');
+
+  // 👇 usamos el DM interno que NO hace rate-limit ni toca historial
+  const replyRaw = await askDMSystem(roomId, userMsg);
+
+  // Limpia por si acaso (el prompt ya le pide no poner CMDs)
+  const reply = stripCmdLines(String(replyRaw || ''));
+  if (reply.trim()) {
+    io.to(roomId).emit('dm', { from: 'DM', text: reply, ts: Date.now() });
+  }
+}
+
 
 // ================== API REST opcional ==================
 app.post('/api/dm', async (req, res) => {
@@ -414,10 +517,10 @@ function handleDMCommands(io, roomId, text) {
         });
         break;
       }
-      case 'REROLL':      rerollCombat(io, roomId); break;
-      case 'NEXT_TURN':   nextTurn(io, roomId);     break;
-      case 'PREV_TURN':   prevTurn(io, roomId);     break;
-      case 'END_COMBAT':  endCombat(io, roomId);    break;
+      case 'REROLL': rerollCombat(io, roomId); break;
+      case 'NEXT_TURN': nextTurn(io, roomId); break;
+      case 'PREV_TURN': prevTurn(io, roomId); break;
+      case 'END_COMBAT': endCombat(io, roomId); break;
       case 'PAUSE': {
         const st = combatStates.get(roomId);
         if (st) { st.running = false; clearTimeout(st._timer); io.to(roomId).emit('combat:update', publicCombatState(st)); }
@@ -432,7 +535,7 @@ function handleDMCommands(io, roomId, text) {
         const rawDur = kv.duration ?? kv.duracion;
         applySettings(io, roomId, {
           durationSec: rawDur != null && rawDur !== '' ? Number(rawDur) : undefined,
-          autoAdvance: kv.auto != null ? ['1','true','si','sí'].includes(String(kv.auto).toLowerCase()) : undefined,
+          autoAdvance: kv.auto != null ? ['1', 'true', 'si', 'sí'].includes(String(kv.auto).toLowerCase()) : undefined,
           autoDelaySec: kv.delay != null ? Number(kv.delay) : undefined
         });
         break;
@@ -472,7 +575,7 @@ function detectImplicitCmd(userText) {
       opts: {
         durationSec: mDur ? Number(mDur[3]) : undefined,
         autoDelaySec: mDel ? Number(mDel[3]) : undefined,
-        autoAdvance: mAut ? ['si','sí','true','1'].includes(mAut[3]) : undefined
+        autoAdvance: mAut ? ['si', 'sí', 'true', '1'].includes(mAut[3]) : undefined
       }
     };
   }
@@ -484,12 +587,6 @@ io.on('connection', (socket) => {
   let currentRoom = null;
   let nickname = `Jugador-${socket.id.slice(0, 4)}`;
 
-  function stripCmdLines(s = '') {
-    if (!s) return s;
-    let out = s.split(/\r?\n/).filter(line => !/^\s*\[CMD:[^\]]+\]\s*$/i.test(line)).join('\n');
-    out = out.replace(/\s*\[CMD:[^\]]+\]\s*/gi, ' ').replace(/\s{2,}/g, ' ').trim();
-    return out;
-  }
 
   function joinRoom(roomId, name) {
     if (currentRoom) socket.leave(currentRoom);
@@ -527,10 +624,10 @@ io.on('connection', (socket) => {
       if (implicit) {
         switch (implicit.cmd) {
           case 'START_COMBAT': startCombat(io, currentRoom, {}); break;
-          case 'REROLL':       rerollCombat(io, currentRoom);    break;
-          case 'NEXT_TURN':    nextTurn(io, currentRoom);        break;
-          case 'PREV_TURN':    prevTurn(io, currentRoom);        break;
-          case 'END_COMBAT':   endCombat(io, currentRoom);       break;
+          case 'REROLL': rerollCombat(io, currentRoom); break;
+          case 'NEXT_TURN': nextTurn(io, currentRoom); break;
+          case 'PREV_TURN': prevTurn(io, currentRoom); break;
+          case 'END_COMBAT': endCombat(io, currentRoom); break;
           case 'PAUSE': {
             const st = combatStates.get(currentRoom);
             if (st) { st.running = false; clearTimeout(st._timer); io.to(currentRoom).emit('combat:update', publicCombatState(st)); }
@@ -541,7 +638,7 @@ io.on('connection', (socket) => {
             if (st) { st.running = true; st.endAt = Date.now() + st.durationSec * 1000; io.to(currentRoom).emit('combat:update', publicCombatState(st)); scheduleAdvance(io, currentRoom); }
             break;
           }
-          case 'SETTINGS':     applySettings(io, currentRoom, implicit.opts || {}); break;
+          case 'SETTINGS': applySettings(io, currentRoom, implicit.opts || {}); break;
         }
       }
 
@@ -583,8 +680,8 @@ io.on('connection', (socket) => {
 
   // Los eventos de combate desde cliente NO se atienden (solo IA)
   [
-    'combat:start','combat:reroll','combat:next','combat:prev',
-    'combat:end','combat:syncPlayers','combat:settings','combat:pause','combat:resume'
+    'combat:start', 'combat:reroll', 'combat:next', 'combat:prev',
+    'combat:end', 'combat:syncPlayers', 'combat:settings', 'combat:pause', 'combat:resume'
   ].forEach(evt => socket.on(evt, () => socket.emit('system', '⛔ Solo el DM (IA) controla el combate.')));
 
   // Estado actual de combate
@@ -634,6 +731,33 @@ io.on('connection', (socket) => {
     broadcastPresence(currentRoom);
     socket.to(currentRoom).emit('system', `${nickname} ha salido de la mesa.`);
   });
+
+socket.on('character:upsert', ({ sheet }) => {
+  if (!currentRoom) return;
+  const map = getRoomCharsMap(currentRoom);
+  map.set(socket.id, { id: socket.id, name: nickname, sheet });
+  io.to(currentRoom).emit('character:all', Array.from(map.values()));
+  // 👇 dispara síntesis automática (debounced)
+  schedulePartySynthesis(io, currentRoom);
+});
+
+socket.on('character:getAll', () => {
+  if (!currentRoom) return;
+  const map = getRoomCharsMap(currentRoom);
+  socket.emit('character:all', Array.from(map.values()));
+});
+
+socket.on('disconnect', () => {
+  if (currentRoom) {
+    const map = getRoomCharsMap(currentRoom);
+    map.delete(socket.id);
+    io.to(currentRoom).emit('character:all', Array.from(map.values()));
+    // También podemos re-sintetizar si cambia el grupo
+    schedulePartySynthesis(io, currentRoom);
+  }
+});
+
+
 });
 
 // ================== Dados ==================
