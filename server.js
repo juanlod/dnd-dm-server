@@ -13,6 +13,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const MODEL = process.env.MODEL || 'gpt-4o-mini';
 const DM_MODE = (process.env.DM_MODE || 'openai').toLowerCase(); // 'openai' | 'mock'
 const RATE_LIMIT_MS = parseInt(process.env.RATE_LIMIT_MS || '1500', 10);
+const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || '900', 10); // 👈 más alto que 450
 
 const FALLBACK_MODELS = (process.env.FALLBACK_MODELS?.split(',') || [
   'gpt-4o-mini',
@@ -56,16 +57,49 @@ function broadcastPresence(roomId) {
 // ================== Prompt del DM ==================
 function buildSystemPrompt() {
   return `Eres "The Dungeon Master", un DM experto de Dungeons & Dragons 5e.
-- Mantén el tono inmersivo, describe con detalles sensoriales sin alargar en exceso.
-- Sigue reglas 5e cuando corresponda; si falta info, pregunta con opciones.
+- Mantén el tono inmersivo, con detalles sensoriales sin alargar en exceso.
+- Usa estrictamente las reglas básicas de 5e en combate.
+- Si falta información (CA, bonificadores, DC, resistencia, etc.), pregunta o propone un valor razonable.
 - Da 3–5 opciones claras al final de cada turno.
-- Cuando se pidan tiradas, indica tipo y DC sugerida (ej: Percepción DC 13).
 - Evita metajuego y no mates gratuitamente a los PJ.
-- Responde en español.
+- Responde SIEMPRE en español.
+
+REGLAS DE COMBATE Y TIRADAS (5e):
+- Ataques de arma/conjuro del PJ: tirada de ataque = 1d20 + bonificador de característica + competencia (si aplica) contra la CA del objetivo.
+  • Ventaja/desventaja: tira 2d20 y elige mayor/menor.
+  • Crítico: 20 natural = golpe crítico (duplica los dados de daño; no dupliques el modificador); 1 natural = fallo automático.
+  • Daño: tira los dados del arma/conjuro + modificador apropiado.
+- Hechizos que fuerzan salvación: el objetivo tira una salvación (p.ej., DEX/WIS/CON) contra la CD de conjuros del lanzador.
+  • Éxito: reduce/niega el efecto según el conjuro.
+- “Esquivas”: si un personaje declara la acción Esquivar (Dodge), los ataques contra él tienen desventaja y él tiene ventaja en salvaciones de DEX hasta su siguiente turno.
+- Pruebas enfrentadas (agarres, forcejeos, esconderse, percibir): pide tiradas enfrentadas apropiadas (p.ej., Atletismo vs Atletismo/Acrobacias, Sigilo vs Percepción pasiva).
+- Propon DC razonable cuando toque (referencia rápida): 10 fácil, 12–13 medio, 15 difícil, 18 muy difícil, 20 muy difícil+.
+- Resistencias/vulnerabilidades: si la ficha lo indica, ajusta el daño (resistencia = mitad, vulnerabilidad = doble).
+- Si el jugador ya publica un resultado de tirada (p.ej., “🎲 1d20+5 → [14] = 19” o “total 17”), úsalo directamente sin pedir repetir.
+- No tires tú los dados salvo que te lo pidan explícitamente; solicita la tirada y espera el resultado del jugador.
+
+FORMATO SUGERIDO DURANTE EL COMBATE:
+1) Pide la tirada concreta:
+   • “Haz un ataque con tu espada larga: 1d20 + STR + competencia vs CA 14 (ventaja si te ayudan).”
+   • “El ogro te ataca: tiraré ataque vs tu CA; si te pones en Esquivar, tendrá desventaja.”
+   • “Salvación de DEX contra CD 13 (explosión de fuego).”
+2) Cuando recibas el resultado, adjudica y pide daño si corresponde:
+   • “Impactas (19 ≥ CA 14). Tira daño 1d8 + STR. (Crítico si fue 20 natural: 2d8 + STR).”
+3) Narra el efecto y anuncia el ajuste de HP:
+   • “Daño aplicado: 9 corte. HP estimado del goblin: 0/7 (cae).”
+   • “Mitad por resistencia al fuego: 6 → 3.”
+4) Cierra el turno con opciones:
+   • “Opciones: (A) Avanzas al siguiente objetivo, (B) Te cubres tras la roca (media cobertura), (C) Esquivar, (D) Retirarte.”
+   • Cuando termines de resolver, avanza el turno.
+
+COORDINACIÓN CON EL TABLERO:
+- Usa los datos de fichas compartidas (CA, HP, CD, rasgos) si están disponibles; si no, pídelo al jugador o asume valores razonables y dilo.
+- Anuncia claramente: “Daño aplicado: -X HP a [nombre]. HP estimado: Y/Z”. El jugador actualizará su ficha.
+- No reveles estadísticas exactas de enemigos a menos que los jugadores las deduzcan.
 
 CUANDO CORRESPONDA, añade AL FINAL de tu mensaje UNA sola línea de control,
 exactamente con uno de estos comandos:
-[CMD:START_COMBAT]                      ← si omites duración, el servidor usará 600 s
+[CMD:START_COMBAT]                      ← si omites duración, el servidor usa 600 s por turno
 [CMD:START_COMBAT duration=SEGUNDOS]    ← opcional; ej. duration=120
 [CMD:REROLL]
 [CMD:NEXT_TURN]
@@ -76,8 +110,9 @@ exactamente con uno de estos comandos:
 [CMD:SETTINGS duration=SEGUNDOS auto=0|1 delay=SEGUNDOS]
 [CMD:SYNC_PLAYERS]
 No inventes otros comandos y no añadas comillas alrededor de la línea CMD.
-Escribe “duration” en **segundos** y OMITE la duración si quieres el valor por defecto (600 s).`;
+Escribe “duration” en segundos y OMITE la duración si quieres el valor por defecto (600 s).`;
 }
+
 
 function getRoomContext(roomId) {
   if (!roomContexts.has(roomId)) {
@@ -102,8 +137,8 @@ function authHeaders() {
   return h;
 }
 
-async function callChatCompletions(model, messages) {
-  const payload = { model, messages, temperature: 0.8, max_tokens: 450 };
+async function callChatCompletions(model, messages, maxTokens = MAX_TOKENS) {
+  const payload = { model, messages, temperature: 0.8, max_tokens: maxTokens };
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: authHeaders(),
@@ -122,28 +157,52 @@ async function callChatCompletions(model, messages) {
     err.type = data?.error?.type;
     throw err;
   }
-  return data?.choices?.[0]?.message?.content?.trim() || '(sin respuesta)';
+  const choice = data?.choices?.[0];
+  return {
+    content: choice?.message?.content?.trim() || '(sin respuesta)',
+    finishReason: choice?.finish_reason || null
+  };
 }
 
-async function askOpenAIWithFallback(allMessages) {
+async function askOpenAIWithFallback(allMessages, { continueIfClipped = true } = {}) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY no configurada');
   const candidates = [MODEL, ...FALLBACK_MODELS].filter((v, i, a) => v && a.indexOf(v) === i);
+
   let lastErr;
   for (const m of candidates) {
     try {
-      return await callChatCompletions(m, allMessages);
+      // 1ª llamada
+      let { content, finishReason } = await callChatCompletions(m, allMessages, MAX_TOKENS);
+
+      // Si el modelo se cortó por longitud y queremos continuar, hacemos 1–2 “continúa”
+      if (continueIfClipped && finishReason === 'length') {
+        let acc = content;
+        let tries = 0;
+        let msgs = [...allMessages, { role: 'assistant', content }];
+
+        while (tries < 2) { // evita bucles largos
+          msgs = [...msgs, { role: 'user', content: 'Continúa exactamente desde donde lo dejaste, sin repetir texto previo.' }];
+          const more = await callChatCompletions(m, msgs, MAX_TOKENS);
+          acc += '\n' + more.content;
+          if (more.finishReason !== 'length') break;
+          msgs = [...msgs, { role: 'assistant', content: more.content }];
+          tries++;
+        }
+        return acc;
+      }
+      return content;
+
     } catch (e) {
       lastErr = e;
       const notFound = e?.status === 404 || e?.code === 'model_not_found';
       const insufficient = e?.status === 429 && (e?.code === 'insufficient_quota' || /quota/i.test(e?.message || ''));
-      if (insufficient) throw e; // no hay cuota
-      if (!notFound) throw e;    // otro error
+      if (insufficient) throw e;          // cuota agotada
+      if (!notFound) throw e;             // otros errores: salir
       console.warn(`[DM] Modelo no disponible: ${m} (${e?.code || e?.status}). Probando siguiente...`);
     }
   }
   throw lastErr;
 }
-
 // ================== Mock DM ==================
 function mockDMReply(userText) {
   const hooks = [
@@ -732,31 +791,50 @@ io.on('connection', (socket) => {
     socket.to(currentRoom).emit('system', `${nickname} ha salido de la mesa.`);
   });
 
-socket.on('character:upsert', ({ sheet }) => {
-  if (!currentRoom) return;
-  const map = getRoomCharsMap(currentRoom);
-  map.set(socket.id, { id: socket.id, name: nickname, sheet });
-  io.to(currentRoom).emit('character:all', Array.from(map.values()));
-  // 👇 dispara síntesis automática (debounced)
-  schedulePartySynthesis(io, currentRoom);
-});
-
-socket.on('character:getAll', () => {
-  if (!currentRoom) return;
-  const map = getRoomCharsMap(currentRoom);
-  socket.emit('character:all', Array.from(map.values()));
-});
-
-socket.on('disconnect', () => {
-  if (currentRoom) {
+  socket.on('character:upsert', ({ sheet }) => {
+    if (!currentRoom) return;
     const map = getRoomCharsMap(currentRoom);
-    map.delete(socket.id);
+    map.set(socket.id, { id: socket.id, name: nickname, sheet });
     io.to(currentRoom).emit('character:all', Array.from(map.values()));
-    // También podemos re-sintetizar si cambia el grupo
+    // 👇 dispara síntesis automática (debounced)
     schedulePartySynthesis(io, currentRoom);
-  }
-});
+  });
 
+  socket.on('character:getAll', () => {
+    if (!currentRoom) return;
+    const map = getRoomCharsMap(currentRoom);
+    socket.emit('character:all', Array.from(map.values()));
+  });
+
+  socket.on('disconnect', () => {
+    if (currentRoom) {
+      const map = getRoomCharsMap(currentRoom);
+      map.delete(socket.id);
+      io.to(currentRoom).emit('character:all', Array.from(map.values()));
+      // También podemos re-sintetizar si cambia el grupo
+      schedulePartySynthesis(io, currentRoom);
+    }
+  });
+
+
+  // Vaciar chat (borra el log en clientes, NO toca memoria del DM)
+  socket.on('chat:clear', ({ by }) => {
+    if (!currentRoom) return;
+    const who = (by || nickname || 'alguien').toString().slice(0, 40);
+    // Señal para que los clientes limpien su lista de mensajes
+    io.to(currentRoom).emit('chat:cleared', { by: who, ts: Date.now() });
+    // Mensaje informativo
+    io.to(currentRoom).emit('system', `🧹 ${who} ha vaciado el chat (solo la vista).`);
+  });
+
+  // Reiniciar contexto del DM (borra historial que usa la IA para razonar)
+  socket.on('dm:reset', () => {
+    if (!currentRoom) return;
+    const ctx = getRoomContext(currentRoom);
+    ctx.messages = [];
+    ctx.lastAskAt = 0;
+    io.to(currentRoom).emit('system', '♻️ El contexto del DM se ha reiniciado para esta mesa.');
+  });
 
 });
 
