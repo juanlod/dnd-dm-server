@@ -1,35 +1,33 @@
-import express from 'express';
-import http from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
+import 'dotenv/config';
+import { createServer } from 'http';
+import { createApp } from './http.js';
+import { attachSocket } from './socket.js';
 
-const app = express();
-const server = http.createServer(app);
+const PORT = Number(process.env.PORT) || 3000;
+const CLIENT_ORIGINS = (process.env.CLIENT_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-const CLIENT_ORIGINS = (process.env.CLIENT_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // permitir tools/health-check
-    if (CLIENT_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS not allowed'), false);
-  }
-}));
-
-const io = new Server(server, {
-  cors: {
-    origin: CLIENT_ORIGINS.length ? CLIENT_ORIGINS : '*',
-    methods: ['GET','POST'],
-    transports: ['websocket','polling']
-  }
+const app = createApp({
+  // si tu createApp acepta opciones, puedes pasar CORS aquí también
 });
 
-io.on('connection', (socket) => {
-  console.log('Socket connected', socket.id);
-  // ... tus eventos: chat, dm, resetDM, clearChat ...
+// ✔️ health checks para Render
+app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+app.head('/healthz', (_req, res) => res.status(200).end());
+
+// Creamos HTTP server y montamos Socket.IO
+const httpServer = createServer(app);
+const io = attachSocket(httpServer, CLIENT_ORIGINS.length ? CLIENT_ORIGINS : '*');
+
+// ✔️ inyecta io a TODAS las rutas (para usar req.io en /api/dm)
+app.use((req, _res, next) => { req.io = io; next(); });
+
+// (Opcional) evitar 404 ruidoso de / y /favicon.ico
+app.get('/', (_req, res) => res.type('text/plain').send('D&D DM server up'));
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`D&D DM server escuchando en :${PORT}`);
 });
-
-app.get('/healthz', (_req,res)=>res.send('ok'));
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`API on :${PORT}`));
