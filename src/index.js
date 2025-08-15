@@ -1,20 +1,35 @@
-import 'dotenv/config';
-import { createServer } from 'http';
-import { createApp } from './http.js';
-import { attachSocket } from './socket.js';
-import { PORT } from './config.js';
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
 
-const app = createApp();
+const app = express();
+const server = http.createServer(app);
 
-// Inyecta io en las rutas REST (para handleDMCommands después de /api/dm)
-app.use((req, _res, next) => {
-  req.io = io; // eslint-disable-line no-undef
-  next();
+const CLIENT_ORIGINS = (process.env.CLIENT_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // permitir tools/health-check
+    if (CLIENT_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS not allowed'), false);
+  }
+}));
+
+const io = new Server(server, {
+  cors: {
+    origin: CLIENT_ORIGINS.length ? CLIENT_ORIGINS : '*',
+    methods: ['GET','POST'],
+    transports: ['websocket','polling']
+  }
 });
 
-const httpServer = createServer(app);
-const io = attachSocket(httpServer, '*'); // CORS abierto; ajusta según necesites
-
-httpServer.listen(PORT, () => {
-  console.log(`D&D DM server escuchando en http://localhost:${PORT}`);
+io.on('connection', (socket) => {
+  console.log('Socket connected', socket.id);
+  // ... tus eventos: chat, dm, resetDM, clearChat ...
 });
+
+app.get('/healthz', (_req,res)=>res.send('ok'));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`API on :${PORT}`));
