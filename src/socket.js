@@ -122,13 +122,13 @@ export function attachSocket(httpServer, corsOrigin = '*') {
     });
 
     // Fichas de personaje
-    socket.on('character:upsert', ({ sheet }) => {
-      if (!currentRoom) return;
-      const map = getRoomCharsMap(currentRoom);
-      map.set(socket.id, { id: socket.id, name: nickname, sheet });
-      io.to(currentRoom).emit('character:all', Array.from(map.values()));
-      schedulePartySynthesis(io, currentRoom);
-    });
+    // socket.on('character:upsert', ({ sheet }) => {
+    //   if (!currentRoom) return;
+    //   const map = getRoomCharsMap(currentRoom);
+    //   map.set(socket.id, { id: socket.id, name: nickname, sheet });
+    //   io.to(currentRoom).emit('character:all', Array.from(map.values()));
+    //   schedulePartySynthesis(io, currentRoom);
+    // });
 
     socket.on('character:getAll', () => {
       if (!currentRoom) return;
